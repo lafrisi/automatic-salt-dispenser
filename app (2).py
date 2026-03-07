@@ -1,7 +1,7 @@
 """
 app.py — Salt Dispenser Home Display with Voice Assistant
 ==========================================================
-Elder-friendly desktop app with:
+User-friendly desktop app with:
   - ElevenLabs text-to-speech voice output
   - Press-and-hold voice input (speech_recognition)
   - Greeting on open that reads current status aloud
@@ -46,7 +46,7 @@ ESP_IP            = "192.168.241.239"
 ESP_BASE          = f"http://{ESP_IP}"
 POLL_MS           = 5000
 
-ELEVENLABS_KEY    = "sk_c9ae5ff6b89f09bfc47e876400e3a803f6a5a99b94e4899b"   # ← paste your key here
+ELEVENLABS_KEY    = "Replace with ElevenLabs API Key"   # ← paste your key here
 ELEVENLABS_VOICE  = "21m00Tcm4TlvDq8ikWAM"                     # ElevenLabs voice name
 
 # ── PALETTE ───────────────────────────────────────────────────────────────────

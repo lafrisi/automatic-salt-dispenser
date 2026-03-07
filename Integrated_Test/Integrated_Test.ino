@@ -24,8 +24,8 @@
 // =============================================================================
 // USER CONFIG — fill these in
 // =============================================================================
-const char* WIFI_SSID     = "I will hack u";
-const char* WIFI_PASSWORD = "Alfrsmhmmd!2598";
+const char* WIFI_SSID     = "Replace with Network Name";
+const char* WIFI_PASSWORD = "Replace with Network Password";
 
 // Coordinates for weather lookup (hardcoded as per design)
 const float LATITUDE  = 43.4516;
