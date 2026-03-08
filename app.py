@@ -1,23 +1,24 @@
 """
-app.py — Salt Dispenser Home Display with Voice Assistant
-==========================================================
-User-friendly desktop app with:
-  - ElevenLabs text-to-speech voice output
-  - Press-and-hold voice input (speech_recognition)
-  - Greeting on open that reads current status aloud
-  - Preset voice commands (no ESP changes needed)
-  - Weather tiles, status card, manual dispense button
+app_tailscale_v2.py — Salt Dispenser  (run on Laptop 1)
+=========================================================
+This is the final demo version of the app.
+Laptop 1 (this file) can be on ANY network.
+Laptop 2 (relay_v2.py) must be on the ESP's hotspot.
+Both laptops must have Tailscale installed and running.
 
-Install dependencies:
-  pip install requests speechrecognition pyaudio elevenlabs
+The only difference from app_tester.py:
+  - ESP_IP   = Laptop 2's Tailscale IP  (run: tailscale ip -4 on Laptop 2)
+  - ESP_PORT = 8080
+  - lbl_conn shows "Connected via Tailscale"
 
-Build exe:
-  pip install pyinstaller
-  pyinstaller --onefile --windowed --name "Salt Dispenser" app.py
+Everything else — UI, Gemini, ElevenLabs, voice — is identical.
 
-NOTE: pyaudio on Windows may need:
-  pip install pipwin
-  pipwin install pyaudio
+Pre-demo checklist:
+  [ ] Tailscale installed on both laptops, signed into same account
+  [ ] relay_v2.py running on Laptop 2
+  [ ] Laptop 2's Tailscale IP entered below as ESP_IP
+  [ ] Both API keys filled in below
+  [ ] Laptop 1 deliberately on a DIFFERENT network to show remote access
 """
 
 import tkinter as tk
@@ -28,7 +29,6 @@ import time
 import queue
 from datetime import datetime
 
-# ElevenLabs + speech recognition
 try:
     from elevenlabs.client import ElevenLabs
     ELEVENLABS_OK = True
@@ -41,15 +41,25 @@ try:
 except ImportError:
     SR_OK = False
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-ESP_IP            = "192.168.241.239"
-ESP_BASE          = f"http://{ESP_IP}"
-POLL_MS           = 5000
+try:
+    from google import genai
+    GEMINI_OK = True
+except ImportError:
+    GEMINI_OK = False
 
-ELEVENLABS_KEY    = "Replace with ElevenLabs API Key"   # ← paste your key here
-ELEVENLABS_VOICE  = "21m00Tcm4TlvDq8ikWAM"                     # ElevenLabs voice name
+# ── CONFIG — only things to change ───────────────────────────────────────────
+ESP_IP           = "Laptop 2's Tailscale IP"              # ← Laptop 2's Tailscale IP
+                                             #   run on Laptop 2: tailscale ip -4
+ESP_PORT         = 8080                      # relay port — do not change
+ESP_BASE         = f"http://{ESP_IP}:{ESP_PORT}"
+POLL_MS          = 5000
 
-# ── PALETTE ───────────────────────────────────────────────────────────────────
+ELEVENLABS_KEY   = "Your ElevenLabs API Key"    # ← paste ElevenLabs key here
+ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"   # Rachel
+
+GEMINI_KEY       = "Your Gemini API Key"         # ← paste Gemini key here
+# ─────────────────────────────────────────────────────────────────────────────
+
 BG          = "#f0f4f8"
 SURFACE     = "#ffffff"
 BLUE        = "#2c6fad"
@@ -68,10 +78,13 @@ WHITE       = "#ffffff"
 MIC_IDLE    = "#2c6fad"
 MIC_LISTEN  = "#e84040"
 MIC_THINK   = "#b45309"
+MIC_GEMINI  = "#7c3aed"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ESP CLIENT
+#  Points to relay_v2.py on Laptop 2 via Tailscale.
+#  The relay forwards everything to the ESP transparently.
 # ══════════════════════════════════════════════════════════════════════════════
 class ESPClient:
     def __init__(self, base):
@@ -79,24 +92,111 @@ class ESPClient:
 
     def status(self):
         try:
-            return requests.get(f"{self.base}/status", timeout=3).json()
+            return requests.get(f"{self.base}/status", timeout=5).json()
         except Exception:
             return None
 
     def manual_dispense(self):
         try:
             return requests.post(f"{self.base}/update",
-                                 json={"manualDispense": True}, timeout=3).json()
+                                 json={"manualDispense": True}, timeout=5).json()
         except Exception as e:
             return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GEMINI ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class GeminiEngine:
+    def __init__(self, api_key: str):
+        if GEMINI_OK and api_key != "YOUR_GEMINI_API_KEY":
+            self.client = genai.Client(api_key=api_key)
+            self.ready = True
+            print("[GEMINI] Connected — Gemini 2.5 Flash ready")
+        else:
+            self.client = None
+            self.ready = False
+            print("[GEMINI] Not configured — falling back to basic responses")
+
+    def ask(self, user_text: str, esp_data: dict) -> str:
+        if not self.ready:
+            return self._fallback(user_text, esp_data)
+
+        if esp_data:
+            dispensing  = esp_data.get("dispensing", False)
+            condition   = esp_data.get("weatherCondition", "unknown")
+            temp_c      = esp_data.get("temperature", 0)
+            temp_f      = int(temp_c * 9 / 5 + 32)
+            next_cond   = esp_data.get("nextCondition", "unknown")
+            next_temp_c = esp_data.get("nextTemperature", 0)
+            next_temp_f = int(next_temp_c * 9 / 5 + 32)
+            healthy     = esp_data.get("systemHealthy", True)
+            context = (
+                f"Device status: {'dispensing salt' if dispensing else 'monitoring, not dispensing'}. "
+                f"System healthy: {healthy}. "
+                f"Current weather: {condition}, {temp_f}°F ({temp_c:.1f}°C). "
+                f"Next hour forecast: {next_cond}, {next_temp_f}°F ({next_temp_c:.1f}°C). "
+            )
+        else:
+            context = "The salt dispenser device is currently offline or unreachable."
+
+        prompt = (
+            "You are a friendly voice assistant built into a smart automatic salt dispenser. "
+            "The device monitors weather and automatically disperses salt on walkways when "
+            "conditions are icy or wet. Your users are elderly people who may not be tech-savvy. "
+            "Always speak in plain, warm, reassuring language. "
+            "Reply in 1 to 2 short conversational sentences only — no lists, no bullet points. "
+            "Never mention technical details like IP addresses, JSON, or API. "
+            f"Current device and weather context: {context}"
+            f"The user asked or said: \"{user_text}\""
+        )
+
+        try:
+            result = self.client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+            response = result.text.strip()
+            print(f"[GEMINI] Response: {response}")
+            return response
+        except Exception as e:
+            print(f"[GEMINI ERROR] {e}")
+            return "I'm having trouble thinking right now. Please try asking again in a moment."
+
+    def _fallback(self, text: str, esp_data: dict) -> str:
+        text = text.lower()
+        if not esp_data:
+            return "The device is not connected right now."
+        condition  = esp_data.get("weatherCondition", "unknown")
+        temp_c     = esp_data.get("temperature", 0)
+        temp_f     = int(temp_c * 9 / 5 + 32)
+        dispensing = esp_data.get("dispensing", False)
+        if any(w in text for w in ["weather", "outside", "condition"]):
+            return f"It is currently {temp_f} degrees and {condition.lower()} outside."
+        if any(w in text for w in ["dispensing", "salt", "walkway", "status"]):
+            return "Salt is being dispensed right now." if dispensing \
+                   else "Your walkway is being monitored and no salt is needed right now."
+        if any(w in text for w in ["temperature", "temp", "degrees"]):
+            return f"The temperature is {temp_f} degrees Fahrenheit."
+        return "I'm not sure about that. Try asking about the weather or your walkway status."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DISPENSE COMMAND DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+DISPENSE_KEYWORDS = [
+    "dispense", "dispense salt", "add salt", "start dispensing",
+    "release salt", "spread salt", "activate"
+]
+
+def is_dispense_command(text: str) -> bool:
+    return any(kw in text.lower() for kw in DISPENSE_KEYWORDS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  VOICE ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 class VoiceEngine:
-    """Handles ElevenLabs TTS output and speech_recognition STT input."""
-
     def __init__(self, api_key: str, voice: str):
         self.voice    = voice
         self.speaking = False
@@ -105,6 +205,7 @@ class VoiceEngine:
         if ELEVENLABS_OK and api_key != "YOUR_ELEVENLABS_API_KEY":
             self.client = ElevenLabs(api_key=api_key)
             self.tts_ready = True
+            print("[VOICE] ElevenLabs TTS ready")
         else:
             self.client    = None
             self.tts_ready = False
@@ -113,7 +214,6 @@ class VoiceEngine:
         if SR_OK:
             self.recognizer = sr.Recognizer()
             self.mic        = sr.Microphone()
-            # Calibrate mic noise level once at startup
             threading.Thread(target=self._calibrate, daemon=True).start()
             self.stt_ready = True
         else:
@@ -129,7 +229,6 @@ class VoiceEngine:
             print(f"[VOICE] Mic calibration failed: {e}")
 
     def speak(self, text: str):
-        """Speak text via ElevenLabs on a background thread."""
         threading.Thread(target=self._speak_worker, args=(text,), daemon=True).start()
 
     def _speak_worker(self, text: str):
@@ -142,26 +241,19 @@ class VoiceEngine:
                     voice_id=self.voice,
                     model_id="eleven_flash_v2_5",
                 )
-                import tempfile, os
-                import pygame
-
+                import tempfile, os, pygame
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
                     for chunk in audio:
                         f.write(chunk)
                     tmp_path = f.name
-
                 pygame.mixer.init()
                 pygame.mixer.music.load(tmp_path)
                 pygame.mixer.music.play()
-
-                # Wait for playback to finish before cleaning up
                 while pygame.mixer.music.get_busy():
                     time.sleep(0.1)
-
                 pygame.mixer.quit()
-                os.unlink(tmp_path)  # delete the temp file after playing
+                os.unlink(tmp_path)
             else:
-                # Fallback: just print if ElevenLabs not configured
                 print(f"[TTS FALLBACK] {text}")
         except Exception as e:
             print(f"[TTS ERROR] {e}")
@@ -169,7 +261,6 @@ class VoiceEngine:
             self.speaking = False
 
     def listen(self) -> str:
-        """Record audio while called, return recognised text or empty string."""
         if not self.stt_ready:
             return ""
         try:
@@ -186,37 +277,6 @@ class VoiceEngine:
         except Exception as e:
             print(f"[STT ERROR] {e}")
             return ""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  VOICE COMMAND MATCHER
-# ══════════════════════════════════════════════════════════════════════════════
-class CommandMatcher:
-    """
-    Maps spoken phrases to actions using keyword matching.
-    No Gemini / NLP needed — just a word bank.
-    """
-
-    # Each entry: (keywords_that_trigger_it, command_key)
-    COMMANDS = [
-        (["weather", "outside", "condition", "raining", "snowing"],  "weather"),
-        (["forecast", "next hour", "later", "coming up"],            "forecast"),
-        (["walkway", "status", "happening", "going on", "okay"],     "status"),
-        (["dispensing", "salt dispensing", "is salt"],               "dispensing"),
-        (["dispense", "start dispensing", "add salt", "release"],    "dispense_now"),
-        (["device", "working", "connected", "online", "system"],     "health"),
-        (["temperature", "temp", "degrees", "how cold", "how warm"], "temperature"),
-        (["help", "commands", "what can", "options", "what do"],     "help"),
-    ]
-
-    @classmethod
-    def match(cls, text: str) -> str | None:
-        text = text.lower()
-        for keywords, cmd in cls.COMMANDS:
-            for kw in keywords:
-                if kw in text:
-                    return cmd
-        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -246,18 +306,18 @@ def now_str():
 class SaltDispenserApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.esp      = ESPClient(ESP_BASE)
-        self.voice    = VoiceEngine(ELEVENLABS_KEY, ELEVENLABS_VOICE)
-        self.esp_data = {}
-        self._mic_held     = False
-        self._mic_thread   = None
+        self.esp    = ESPClient(ESP_BASE)
+        self.voice  = VoiceEngine(ELEVENLABS_KEY, ELEVENLABS_VOICE)
+        self.gemini = GeminiEngine(GEMINI_KEY)
+        self.esp_data    = {}
+        self._mic_held   = False
+        self._mic_thread = None
 
         self.title("Salt Dispenser")
         self.geometry("700x700")
         self.resizable(False, False)
         self.configure(bg=BG)
 
-        # Fonts
         self.f_huge  = tkfont.Font(family="Georgia", size=30, weight="bold")
         self.f_large = tkfont.Font(family="Georgia", size=20, weight="bold")
         self.f_med   = tkfont.Font(family="Georgia", size=14)
@@ -269,11 +329,8 @@ class SaltDispenserApp(tk.Tk):
 
         self._build()
         self._start_poll()
-
-        # Greet after 1.5 s so window is fully visible first
         self.after(1500, self._greet)
 
-    # ── BUILD UI ──────────────────────────────────────────────────────────────
     def _build(self):
         # Top bar
         top = tk.Frame(self, bg=BLUE, height=64)
@@ -289,22 +346,19 @@ class SaltDispenserApp(tk.Tk):
                                  font=self.f_tiny, bg=BLUE, fg="#bcd8f5")
         self.lbl_conn.pack(side="right", padx=4)
 
-        # Main status card
+        # Status card
         self.status_card = tk.Frame(self, bg=SURFACE,
                                     highlightbackground=GREY_LIGHT,
                                     highlightthickness=1)
         self.status_card.pack(fill="x", padx=24, pady=(16, 8))
-
         self.lbl_icon = tk.Label(self.status_card, text="⏳",
                                  font=tkfont.Font(size=42), bg=SURFACE)
         self.lbl_icon.pack(pady=(20, 4))
-
         self.lbl_main = tk.Label(self.status_card,
                                  text="Checking your walkway…",
                                  font=self.f_huge, bg=SURFACE, fg=TEXT,
                                  wraplength=620, justify="center")
         self.lbl_main.pack(pady=(0, 4))
-
         self.lbl_sub = tk.Label(self.status_card,
                                 text="Please wait while we connect.",
                                 font=self.f_med, bg=SURFACE, fg=TEXT_MED,
@@ -328,49 +382,33 @@ class SaltDispenserApp(tk.Tk):
             cursor="hand2", command=self._manual_dispense)
         self.btn_dispense.pack(fill="x", padx=24, pady=(0, 8))
 
-        # ── VOICE SECTION ──
+        # Voice section
         voice_frame = tk.Frame(self, bg=SURFACE,
                                highlightbackground=GREY_LIGHT,
                                highlightthickness=1)
         voice_frame.pack(fill="x", padx=24, pady=(0, 8))
-
-        # Voice status label
         self.lbl_voice_status = tk.Label(voice_frame,
                                          text="🎙️  Press and hold to speak",
                                          font=self.f_med, bg=SURFACE, fg=TEXT_MED)
         self.lbl_voice_status.pack(pady=(12, 6))
-
-        # Mic button — press and hold
         self.btn_mic = tk.Button(
-            voice_frame,
-            text="🎤  Hold to Talk",
-            font=self.f_mic,
-            bg=MIC_IDLE, fg=WHITE,
-            activebackground=MIC_LISTEN,
-            activeforeground=WHITE,
-            relief="flat", bd=0,
-            padx=30, pady=12,
-            cursor="hand2"
+            voice_frame, text="🎤  Hold to Talk",
+            font=self.f_mic, bg=MIC_IDLE, fg=WHITE,
+            activebackground=MIC_LISTEN, activeforeground=WHITE,
+            relief="flat", bd=0, padx=30, pady=12, cursor="hand2"
         )
-        self.btn_mic.pack(pady=(0, 12))
-
-        # Bind press and release
+        self.btn_mic.pack(pady=(0, 6))
         self.btn_mic.bind("<ButtonPress-1>",   self._mic_press)
         self.btn_mic.bind("<ButtonRelease-1>", self._mic_release)
-
-        # Last heard label
-        self.lbl_heard = tk.Label(voice_frame,
-                                  text="",
+        self.lbl_heard = tk.Label(voice_frame, text="",
                                   font=self.f_tiny, bg=SURFACE, fg=TEXT_LIGHT,
                                   wraplength=600, justify="center")
         self.lbl_heard.pack(pady=(0, 10))
 
-        # Footer
         self.lbl_footer = tk.Label(self, text="Last updated: —",
                                    font=self.f_tiny, bg=BG, fg=TEXT_LIGHT)
         self.lbl_footer.pack(pady=(4, 6))
 
-    # ── TILE WIDGET ───────────────────────────────────────────────────────────
     def _tile(self, parent, title):
         f = tk.Frame(parent, bg=SURFACE,
                      highlightbackground=GREY_LIGHT, highlightthickness=1)
@@ -381,8 +419,7 @@ class SaltDispenserApp(tk.Tk):
         f._cond  = tk.Label(f, text="—", font=self.f_med_b,
                             bg=SURFACE, fg=TEXT, wraplength=260, justify="center")
         f._cond.pack(pady=(2, 0))
-        f._temp  = tk.Label(f, text="—", font=self.f_small,
-                            bg=SURFACE, fg=TEXT_MED)
+        f._temp  = tk.Label(f, text="—", font=self.f_small, bg=SURFACE, fg=TEXT_MED)
         f._temp.pack(pady=(2, 12))
         return f
 
@@ -392,7 +429,6 @@ class SaltDispenserApp(tk.Tk):
         tile._temp.config(
             text=fmt_temp(temp_c) if isinstance(temp_c, (int, float)) else "—")
 
-    # ── POLLING ───────────────────────────────────────────────────────────────
     def _start_poll(self):
         self._tick_clock()
         def loop():
@@ -410,7 +446,7 @@ class SaltDispenserApp(tk.Tk):
         if data is None:
             self._set_status(AMBER_LIGHT, AMBER, "📡",
                              "Device not reachable",
-                             "Make sure the salt dispenser is plugged in and your Wi-Fi is working.\n"
+                             "Make sure the salt dispenser is plugged in and the relay is running.\n"
                              "The app will keep trying automatically.")
             self.lbl_conn.config(text="● Offline", fg="#fbbf24")
             self._update_tile(self.tile_now,  "—", "No data", "—")
@@ -442,7 +478,8 @@ class SaltDispenserApp(tk.Tk):
 
         self._update_tile(self.tile_now,  weather_emoji(wx_now),  wx_now,  temp_now)
         self._update_tile(self.tile_next, weather_emoji(wx_next), wx_next, temp_next)
-        self.lbl_conn.config(text="● Connected", fg="#a8d4f5")
+        # shows judges this is running over Tailscale
+        self.lbl_conn.config(text="● Connected via Tailscale", fg="#a8d4f5")
         self.lbl_footer.config(text=f"Last updated: {now_str()}")
 
     def _set_status(self, bg, fg, icon, main, sub):
@@ -451,7 +488,6 @@ class SaltDispenserApp(tk.Tk):
         self.lbl_main.config(text=main, bg=bg, fg=fg)
         self.lbl_sub.config(text=sub,   bg=bg, fg=TEXT_MED)
 
-    # ── MANUAL DISPENSE ───────────────────────────────────────────────────────
     def _manual_dispense(self):
         self.btn_dispense.config(state="disabled", text="  Sending…  ")
         def _do():
@@ -473,42 +509,36 @@ class SaltDispenserApp(tk.Tk):
         self.btn_dispense.config(text="  💧  Dispense Salt Now  ",
                                  bg=BLUE, state="normal")
 
-    # ── GREETING ──────────────────────────────────────────────────────────────
     def _greet(self):
-        """Spoken greeting on app open using current ESP data."""
         data = self.esp_data
         if data:
-            condition = data.get("weatherCondition", "unknown conditions")
-            temp_c    = data.get("temperature", 0)
-            temp_f    = int(temp_c * 9/5 + 32)
+            condition  = data.get("weatherCondition", "unknown conditions")
+            temp_c     = data.get("temperature", 0)
+            temp_f     = int(temp_c * 9/5 + 32)
             dispensing = data.get("dispensing", False)
             healthy    = data.get("systemHealthy", True)
-
             if not healthy:
                 status_line = "However, the device may need attention."
             elif dispensing:
                 status_line = "Salt is currently being dispensed to protect your walkway."
             else:
                 status_line = "Your walkway is being monitored and no salt is needed right now."
-
             greeting = (
                 f"Hello! Welcome to your Salt Dispenser app. "
                 f"Your device is connected and working. "
                 f"Outside right now it is {temp_f} degrees and {condition.lower()}. "
                 f"{status_line} "
-                f"Press and hold the Talk button at any time to ask me a question."
+                f"Press and hold the Talk button at any time to ask me anything."
             )
         else:
             greeting = (
                 "Hello! Welcome to your Salt Dispenser app. "
                 "I'm trying to connect to your device. "
                 "Please make sure the salt dispenser is plugged in and nearby. "
-                "Press and hold the Talk button at any time to ask me a question."
+                "Press and hold the Talk button at any time to ask me anything."
             )
-
         self.voice.speak(greeting)
 
-    # ── MIC BUTTON ────────────────────────────────────────────────────────────
     def _mic_press(self, event):
         if self._mic_held:
             return
@@ -516,25 +546,19 @@ class SaltDispenserApp(tk.Tk):
         self.btn_mic.config(bg=MIC_LISTEN, text="🔴  Listening…")
         self.lbl_voice_status.config(text="🎙️  Listening — release when done speaking")
         self.lbl_heard.config(text="")
-
-        # Start recording on background thread
         self._mic_thread = threading.Thread(target=self._record, daemon=True)
         self._mic_thread.start()
 
     def _mic_release(self, event):
-        # Signal the recognizer to stop (it will naturally stop on phrase_time_limit)
-        # The _record thread handles the full cycle
         self._mic_held = False
         self.btn_mic.config(bg=MIC_THINK, text="⏳  Processing…")
         self.lbl_voice_status.config(text="⏳  Processing your request…")
 
     def _record(self):
-        """Runs on background thread — listens then processes command."""
         text = self.voice.listen()
         self.after(0, self._handle_command, text)
 
     def _handle_command(self, text: str):
-        """Back on main thread — match command and respond."""
         self.btn_mic.config(bg=MIC_IDLE, text="🎤  Hold to Talk")
 
         if not text:
@@ -544,96 +568,26 @@ class SaltDispenserApp(tk.Tk):
             return
 
         self.lbl_heard.config(text=f'You said: "{text}"')
-        cmd = CommandMatcher.match(text)
-        data = self.esp_data
 
-        if cmd is None:
+        if is_dispense_command(text):
+            self.lbl_voice_status.config(text="💧  Dispensing salt now…")
+            self.voice.speak("Okay, dispensing salt now.")
+            self.after(100, self._manual_dispense)
             self.lbl_voice_status.config(text="🎙️  Press and hold to speak")
-            self.voice.speak(
-                "I'm not sure what you meant. "
-                "Try saying things like: what's the weather, "
-                "is salt dispensing, or help."
-            )
             return
 
-        # ── Build response based on matched command ──
-        response = ""
+        self.btn_mic.config(bg=MIC_GEMINI, text="✨  Thinking…")
+        self.lbl_voice_status.config(text="✨  Asking assistant…")
 
-        if cmd == "weather":
-            if data:
-                cond   = data.get("weatherCondition", "unknown")
-                temp_c = data.get("temperature", 0)
-                temp_f = int(temp_c * 9/5 + 32)
-                response = f"Right now outside it is {temp_f} degrees Fahrenheit, {temp_c:.1f} Celsius, and {cond.lower()}."
-            else:
-                response = "I can't get weather data right now. The device may be offline."
+        def _ask_gemini():
+            response = self.gemini.ask(text, self.esp_data)
+            def _respond():
+                self.btn_mic.config(bg=MIC_IDLE, text="🎤  Hold to Talk")
+                self.lbl_voice_status.config(text="🎙️  Press and hold to speak")
+                self.voice.speak(response)
+            self.after(0, _respond)
 
-        elif cmd == "forecast":
-            if data:
-                cond   = data.get("nextCondition", "unknown")
-                temp_c = data.get("nextTemperature", 0)
-                temp_f = int(temp_c * 9/5 + 32)
-                response = f"Next hour it will be {temp_f} degrees Fahrenheit and {cond.lower()}."
-            else:
-                response = "Forecast data isn't available right now."
-
-        elif cmd == "status":
-            if data:
-                dispensing = data.get("dispensing", False)
-                cond       = data.get("weatherCondition", "unknown")
-                temp_c     = data.get("temperature", 0)
-                temp_f     = int(temp_c * 9/5 + 32)
-                if dispensing:
-                    response = f"Your walkway is being protected. Salt is dispensing right now. It is {temp_f} degrees and {cond.lower()} outside."
-                else:
-                    response = f"Your walkway is being monitored. No salt needed right now. It is {temp_f} degrees and {cond.lower()} outside."
-            else:
-                response = "The device is not connected right now."
-
-        elif cmd == "dispensing":
-            if data:
-                dispensing = data.get("dispensing", False)
-                response = "Yes, salt is being dispensed right now." if dispensing \
-                           else "No, salt is not dispensing right now. The system will activate automatically when needed."
-            else:
-                response = "I can't check dispensing status — the device appears offline."
-
-        elif cmd == "dispense_now":
-            response = "Okay, I'll dispense salt now."
-            self.after(100, self._manual_dispense)
-
-        elif cmd == "health":
-            if data:
-                healthy = data.get("systemHealthy", False)
-                rssi    = data.get("wifi_rssi", 0)
-                response = f"The device is connected and working normally. Wi-Fi signal strength is {rssi} decibels." \
-                           if healthy else "The device may need attention. Please check that it is plugged in."
-            else:
-                response = "The device is not reachable right now. Please check it is plugged in."
-
-        elif cmd == "temperature":
-            if data:
-                temp_c = data.get("temperature", 0)
-                temp_f = int(temp_c * 9/5 + 32)
-                response = f"The current temperature outside is {temp_f} degrees Fahrenheit, or {temp_c:.1f} degrees Celsius."
-            else:
-                response = "Temperature data isn't available right now."
-
-        elif cmd == "help":
-            response = (
-                "Here are things you can ask me. "
-                "Say: what's the weather, "
-                "what's the forecast, "
-                "how's my walkway, "
-                "is salt dispensing, "
-                "dispense salt, "
-                "is the device working, "
-                "or what's the temperature."
-            )
-
-        self.lbl_voice_status.config(text="🎙️  Press and hold to speak")
-        if response:
-            self.voice.speak(response)
+        threading.Thread(target=_ask_gemini, daemon=True).start()
 
 
 # ── RUN ───────────────────────────────────────────────────────────────────────

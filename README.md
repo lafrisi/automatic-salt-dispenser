@@ -1,216 +1,139 @@
-# AutoSalt — Smart Salt Dispenser
-> HackCanada 2026
+# AutoThaw
 
-AutoSalt is an IoT salt dispenser that automatically detects icy and wet weather conditions and dispenses salt to protect walkways — with a voice-assisted desktop app designed for elderly users.
+An IoT-based automatic salt dispenser for residential walkways. The device monitors local weather conditions in real time and disperses salt when temperatures drop below freezing and precipitation is detected, with full remote monitoring and manual control from anywhere in the world.
+
+---
+
+## Overview
+
+The system is made up of three parts working together. The ESP32-S3 microcontroller sits inside the dispenser unit, connects to a local hotspot, and fetches hourly weather forecasts. When conditions are dangerous it automatically runs the dispense cycle. A relay script runs on a second laptop connected to the same hotspot, bridging the ESP to the outside world. The desktop app runs on any laptop, on any network, and connects back to the relay over an encrypted Tailscale tunnel, giving the user live status, manual control, and a voice assistant no matter where they are.
 
 ---
 
 ## How It Works
 
-An ESP32-S3 monitors local weather every 10 minutes using the [Open-Meteo](https://open-meteo.com/) free API. If the temperature is below freezing **and** dangerous precipitation is detected, the motor activates and disperses salt automatically. A desktop app provides a live status display, manual override, and a voice assistant so users with limited mobility or vision can interact hands-free.
+The ESP polls the Open-Meteo weather API every 10 minutes using the device's GPS coordinates. If the current hour is both below 0°C and matches a dangerous weather code such as freezing drizzle, snow, ice fog, rain, or thunderstorms, it triggers the dispense cycle automatically. The cycle spins a DC motor to full speed, sweeps a servo from 0 to 30 degrees to open the lid, holds it open for one second while salt pours out, then closes the lid and shuts the motor off.
 
-```
-Open-Meteo API
-      ↓
-   ESP32-S3  ←──── POST /update (manual dispense)
-   (weather + motor + webserver)
-      ↓
-   GET /status (every 5s)
-      ↓
-   Desktop App (app.py)
-      ↓
-   Voice Assistant (ElevenLabs TTS + Google STT)
-```
+The desktop app polls the device every 5 seconds and displays the current weather condition, temperature, next-hour forecast, and system health. The voice assistant accepts natural language questions spoken aloud by holding a button, passes them to Gemini 2.5 Flash with the live device context, and speaks the response back using ElevenLabs text-to-speech.
 
----
-
-## Features
-
-- **Auto-dispensing** — triggers when cold (< 0°C) and wet weather codes are detected
-- **Manual override** — button in app or voice command instantly triggers a dispense cycle
-- **Voice assistant** — press and hold to ask questions; spoken responses via ElevenLabs
-- **Elder-friendly UI** — large text, high contrast, simple status messages, no technical jargon
-- **Static IP** — ESP always claims the same address so the app never loses connection
-- **Offline-safe** — app degrades gracefully when ESP is unreachable
+The remote access works through Tailscale, which creates an encrypted peer-to-peer tunnel between the two laptops. The ESP never needs a public IP address or port forwarding. The app on Laptop 1 simply targets Laptop 2's Tailscale IP, and Tailscale handles the rest regardless of what network either machine is on.
 
 ---
 
 ## Hardware
 
-| Component | Details |
-|-----------|---------|
-| Microcontroller | ESP32-S3 Dev Module |
-| Motor | DC motor on GPIO 5, PWM via LEDC |
-| Network | 2.4GHz WiFi hotspot |
+| Component | Role |
+|---|---|
+| ESP32-S3 | Microcontroller, WiFi, web server, motor and servo control |
+| MG996R Servo | Opens and closes the dispenser lid |
+| DC Motor and Driver | Agitates and pushes salt through the opening |
+| Salt container with hinged lid | Stores and releases salt onto the walkway |
+
+Wiring connections to the ESP32-S3:
+
+- Servo signal wire to GPIO 38
+- DC motor driver input to GPIO 40
+
+The enclosure can be 3D printed or hand-built. The servo controls a hinged lid over the salt opening, and the DC motor sits inside the container to move salt toward the exit during a dispense cycle.
 
 ---
 
-## Project Structure
+## File Structure
 
-```
-AutoSalt/
-├── Integrated_Test.ino     # ESP32 firmware — weather + webserver + motor
-├── app.py                  # Desktop app — UI + voice assistant
-└── README.md
-```
-
----
-
-## ESP32 Setup
-
-### 1. Install Arduino Libraries
-In Arduino IDE go to **Sketch → Manage Libraries** and install:
-- `ArduinoJson` by Benoit Blanchon (v6 or v7)
-
-`WiFi`, `WebServer`, and `HTTPClient` are built into the ESP32 core.
-
-### 2. Configure credentials
-Open `Integrated_Test.ino` and fill in the top section:
-```cpp
-const char* WIFI_SSID     = "your_network_name";
-const char* WIFI_PASSWORD = "your_password";
-
-const float LATITUDE  = 43.4516;   // your coordinates
-const float LONGITUDE = -80.4925;
-
-IPAddress STATIC_IP(192, 168, x, x);   // desired static IP
-IPAddress GATEWAY  (192, 168, x, x);   // your router/hotspot gateway
-```
-
-### 3. Flash and get the IP
-Select **Tools → Board → ESP32S3 Dev Module**, select the correct COM port, and upload.
-
-Open Serial Monitor at **115200 baud** and press the EN/RST button. You will see:
-```
-[WiFi] Connected!
-[ESP]  IP Address: http://192.168.x.x   <- copy this
-[HTTP] Server started
-```
-
-### 4. Verify
-Open a browser and go to `http://192.168.x.x/status` — you should see live JSON.
+| File | Description |
+|---|---|
+| `app.py` | Desktop app, runs on Laptop 1, works on any network |
+| `relay_v3.py` | Relay bridge, runs on Laptop 2, must be on the ESP's hotspot |
+| `esp_control.ino` | ESP32-S3 firmware |
 
 ---
 
-## Desktop App Setup
+## Requirements
 
-### Requirements
-```bash
-pip install requests speechrecognition elevenlabs pygame
-pip install pipwin
-pipwin install pyaudio       # Windows only
+Python dependencies for both laptops:
+
+```
+flask
+requests
+elevenlabs
+speechrecognition
+google-genai
+pygame
 ```
 
-### Configure
-Open `app.py` and set:
+Arduino libraries, installable via Sketch > Manage Libraries:
+
+- ArduinoJson by Benoit Blanchon
+- ESP32Servo by Kevin Harrington
+- WiFi, WebServer, and HTTPClient are built into the ESP32 board package
+
+Tailscale must be installed on both laptops and both signed into the same account. Download at tailscale.com/download.
+
+---
+
+## Configuration
+
+**API keys** - open `app.py` and fill in:
+
 ```python
-ESP_IP           = "192.168.x.x"           # IP from Serial Monitor
-ELEVENLABS_KEY   = "your_api_key_here"      # from elevenlabs.io -> Profile -> API Key
-ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel (free tier voice ID)
+ELEVENLABS_KEY = "your_key"    # from elevenlabs.io under Profile > API Keys
+GEMINI_KEY     = "your_key"    # from aistudio.google.com under Get API Key
 ```
 
-### Run
-```bash
+**Hotspot credentials** - open `esp_control.ino` and set:
+
+```cpp
+const char* WIFI_SSID     = "your_hotspot_name";
+const char* WIFI_PASSWORD = "your_hotspot_password";
+```
+
+**Location** - coordinates default to Waterloo, Ontario. To change them:
+
+```cpp
+const float LATITUDE  = 43.4516;
+const float LONGITUDE = -80.4925;
+```
+
+---
+
+## Running the System
+
+**1. Flash the ESP**
+
+Disconnect the motor driver power before flashing to prevent the motor from briefly spinning during boot. Open `esp_control.ino` in Arduino IDE, set your hotspot credentials, and upload to the ESP32-S3. Reconnect the motor driver, then open Serial Monitor at 115200 baud. The device will print its assigned IP address on boot, copy it.
+
+**2. Start the relay on Laptop 2**
+
+Connect Laptop 2 to the ESP's hotspot. Paste the ESP's IP into `relay_v3.py` as `ESP_LOCAL_IP`, then run:
+
+```
+python relay_v3.py
+```
+
+Open `http://localhost:8080/health` in a browser to confirm the relay is running. Then run `tailscale ip -4` to get Laptop 2's Tailscale IP and pass it to whoever is running the app.
+
+**3. Start the app on Laptop 1**
+
+Paste Laptop 2's Tailscale IP into `app.py` as `ESP_IP`, then run:
+
+```
 python app.py
 ```
 
-### Build standalone .exe (Windows)
-```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "Salt Dispenser" app.py
-# Output: dist/Salt Dispenser.exe
-```
+The connection indicator in the top bar will show Connected via Tailscale once the device is reachable.
 
 ---
 
-## Voice Commands
+## Voice Assistant
 
-| Say | Response |
-|-----|----------|
-| "What's the weather?" | Current condition and temperature |
-| "What's the forecast?" | Next hour prediction |
-| "How's my walkway?" | Full status summary |
-| "Is salt dispensing?" | Yes or no |
-| "Dispense salt" | Triggers a manual dispense cycle |
-| "What's the temperature?" | Temp in F and C |
-| "Is the device working?" | Connection and system health |
-| "Help" | Lists all available commands |
+Hold the Talk button and speak naturally. The assistant understands questions about current weather, walkway status, and temperature, and accepts voice commands to manually trigger a dispense cycle. All responses are spoken aloud. Example prompts:
+
+- "What is the weather like outside?"
+- "Is the walkway being monitored right now?"
+- "Dispense salt now"
 
 ---
 
-## Auto-Dispense Logic
+## Remote Access
 
-The ESP checks conditions after every weather fetch:
-
-```
-temperature < 0 degrees C
-    AND
-weatherCode in [48, 51, 53, 55, 61, 63, 65, 71, 73, 75, 80, 81, 82, 95, 96, 99]
-    AND
-current hour != last dispensed hour
-        |
-        v
-    dispenseSalt()
-```
-
-Weather codes cover: icy fog, drizzle, rain, snow, showers, and thunderstorms.
-
----
-
-## API Reference
-
-The ESP hosts these endpoints on port 80:
-
-### `GET /status`
-Returns current device state.
-```json
-{
-  "dispensing": false,
-  "weatherCondition": "Heavy snow",
-  "temperature": -3.2,
-  "nextCondition": "Moderate snow",
-  "nextTemperature": -4.1,
-  "systemHealthy": true,
-  "uptime_s": 3600,
-  "wifi_rssi": -42,
-  "esp_ip": "192.168.241.239",
-  "last_dispense_hr": "14:00"
-}
-```
-
-### `POST /update`
-Trigger a manual dispense cycle.
-```json
-{ "manualDispense": true }
-```
-Response:
-```json
-{ "success": true }
-```
-
----
-
-## Switching Networks
-
-When moving to a new WiFi network:
-
-1. Update `WIFI_SSID` and `WIFI_PASSWORD` in the `.ino` file
-2. Update `STATIC_IP` and `GATEWAY` to match the new network
-3. Reflash the ESP
-4. Copy the new IP from Serial Monitor into `app.py`
-
----
-
-## Built With
-
-- [ESP32 Arduino Core](https://github.com/espressif/arduino-esp32)
-- [Open-Meteo](https://open-meteo.com/) — free weather API, no key required
-- [ArduinoJson](https://arduinojson.org/)
-- [ElevenLabs](https://elevenlabs.io/) — text-to-speech
-- [SpeechRecognition](https://pypi.org/project/SpeechRecognition/) — Google STT
-- [Tkinter](https://docs.python.org/3/library/tkinter.html) — desktop UI
-- [pygame](https://www.pygame.org/) — audio playback
-
----
-
-*HackCanada 2026*
+Laptop 1 can be on an entirely different network from the device, whether that is a different WiFi, cellular, or another city entirely, and the app will still connect, display live data, and accept manual commands. The Tailscale tunnel encrypts all traffic between the two laptops and requires no router configuration on either end.
